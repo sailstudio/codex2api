@@ -1,0 +1,43 @@
+# 本地覆盖：让 codex2api 容器接入 Prism 通道。
+#
+# 两个必须解决的问题（均已实测）：
+#
+#  1) 代理注入：Docker CLI 会从 ~/.docker/config.json 注入 127.0.0.1:7897，
+#     容器内 127.0.0.1 是容器自己 → 必然 connection refused。而 colima 的 VM
+#     出网本来就走宿主 FlClash 的 TUN，容器内直连的出口 IP 与宿主完全一致
+#     （新加坡节点，见宿主 `curl -s ipinfo.io/json`）。故显式清空代理，既避免 502，又保证
+#     cf_clearance 绑定的出口 IP 与浏览器登录时一致。
+#
+#  2) sentinel 铸造：官方镜像内**没有 node**（sentinel SDK 需 node 才能算 proof）。
+#     因此在宿主常驻一个铸造服务（cmd/prism-sentinel/daemon.js，监听 8791），
+#     容器通过 PRISM_SENTINEL_CMD 用 curl 经 host.docker.internal 取票。
+#
+# 启动顺序：
+#   # 宿主（两个常驻侧车）
+#   node cmd/prism-material/daemon.js      # 材料保温 → 写 /tmp/prism_sidecar/material.json
+#   node cmd/prism-sentinel/daemon.js      # sentinel 铸造 → 127.0.0.1:8791
+#   # 容器
+#   docker compose -f docker-compose.sqlite.yml -f docker-compose.local-override.yml up -d
+services:
+  codex2api:
+    environment:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      ALL_PROXY: ""
+      NO_PROXY: "*"
+      no_proxy: "*"
+      # ── Prism 通道 ──────────────────────────────────────────────
+      # 材料文件（挂载进来，宿主侧车负责周期刷新）
+      PRISM_MATERIAL_PATH: /prism/material.json
+      # sentinel 铸造：容器无 node，走宿主常驻服务取票
+      # ⚠️ 用 wget 而非 curl —— alpine 基底**只有 wget/nc，没有 curl**
+      PRISM_SENTINEL_CMD: "wget -q -O- --timeout=60 http://host.docker.internal:8791/token"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 材料目录只读挂载（：ro 防止容器误写坏文件）
+      # ⚠️ 必须在 colima 共享路径下（默认**只共享 /Users**）；写成 /tmp/... 会被
+      #    挂成**空目录**且不报错，容器内表现为 material.json no such file。
+      - "${PRISM_MATERIAL_DIR:-${HOME}/prism_material}:/prism:ro"

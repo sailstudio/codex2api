@@ -1,0 +1,260 @@
+# Prism 协议校准报告
+
+> 起因：拿到一份第三方逆向资料包（`@.zip`），需要判断它与我方实现谁对谁错。
+> 结论：**资料包在关键路径上写错了，但它的思路给了我验证的方向。**
+> 本报告所有结论都有可复现的实验或源码证据，不含推测。
+
+---
+
+## 一、最关键的分歧：`/api/llm/` vs `/api/lim/`
+
+原始逆向文档（以及最初那份聊天记录）写的是 `/api/lim/response_with_tools_start`。
+资料包里则全部写作 `/api/llm/`。两者必有一错，而且错的那个会让服务完全不可用。
+
+### 证据 1：对真实上游探测（3/3 可复现，两种请求头都试过）
+
+| 路径 | HTTP | Content-Type | 响应体开头 |
+|---|---|---|---|
+| `/api/llm/response_with_tools_start` | **200 / 401** | `application/json` | `{"status":"completed","request_id":"cf3eb536-…"` |
+| `/api/lim/response_with_tools_start` | 404 | `text/html` | `<!DOCTYPE html>…<title>404: This page could not be found.` |
+
+`/api/lim/…` 返回的东西和一个**随便编的路径**完全相同（Next.js 的 404 页），
+说明它根本不是一个路由。`/api/llm/…` 返回的是真实业务 JSON。
+
+### 证据 2：前端源码（决定性）
+
+```
+$ grep -c "api/lim" *.js        → 0     （前端从不调用 /api/lim/）
+$ grep -ohE '/api/llm/[a-z_]+' *.js | sort -u
+/api/llm/response_with_tools_start
+/api/llm/response_with_tools_status
+/api/llm/response_with_tools_stop
+```
+
+应用自己调的就是 `llm`。这是最后的判定依据，不需要再争论。
+
+**结论：`lim` 是早期文档的笔误。已修正。**
+
+---
+
+## 二、真实协议（已实测校准）
+
+### start
+
+```http
+POST /api/llm/response_with_tools_start
+Content-Type: application/json
+
+{
+  "input": [                                   // ← 必须是数组，不是 messages
+    {"type":"message","role":"user","content":[{"type":"input_text","text":"…"}]},
+    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"…"}]}
+  ],
+  "previousResponseId": "req-…",               // 可选，多轮延续（camelCase）
+  "conversationId": "…",                       // 可选（camelCase）
+  "metadata": {                                // ← 模型参数在这里，不在顶层
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": "medium",
+    "projectId": "…",
+    "frontend_origin": "https://prism.openai.com"
+  }
+}
+```
+
+**关键点**：模型不在请求体顶层，而是在 `metadata` 里。
+上游对 `input` 的类型校验很直接——不是数组就回
+`{"status":"error","message":"input must be an array"}`。
+
+### start 的两种返回
+
+```jsonc
+// 形态 A：需要轮询
+{"status":"started","request_id":"…","conversation_id":null,"turn_state":{"…":"…"}}
+
+// 形态 B：已经结束（短回答 / 命中缓存 / 立刻失败）
+{"status":"completed","request_id":"…","response":{"status":"success","payload":{…}}}
+```
+
+### status
+
+```http
+POST /api/llm/response_with_tools_status
+
+{"request_id":"…","turn_state":{…}}     // ← 两个都必填
+```
+
+`turn_state` 是**服务端下发的不透明令牌**，必须原样回传。
+实测任何自造的值都会被拒（回 `turn_state is required`），
+所以它不是"客户端自己的状态"，而是一个续令牌——每轮都要换成服务端最新给的那个。
+
+```jsonc
+// 还没好
+{"status":"pending","request_id":"…","turn_state":{…新令牌…}}
+// 好了
+{"status":"completed","request_id":"…","turn_state":{…},"response":{…}}
+```
+
+### stop
+
+```http
+POST /api/llm/response_with_tools_stop
+
+{"request_id":"…","conversation_id":"…","turn_state":{…}}
+```
+
+前端"停止"按钮走的就是它。**这一条我们之前完全没实现**——意味着客户端断开后
+上游那条生成会继续跑完并扣额度，对一个"额度即成本"的代理来说纯属白花钱。
+
+### 答案在哪里
+
+```
+response.payload.output[-1].content[*].text
+```
+
+只取**最后一条** output 条目：多轮会话下 `output` 会累积历史，
+全拼会把上一轮的回答当成这一轮的结果。
+块类型 `input_image` / `input_file` 是用户输入的回显，不计入正文。
+
+---
+
+## 三、我方实现里被这次对比揪出来的 6 个真问题
+
+这些都是**实际 bug**，不是风格问题，全部已修 + 补了回归测试。
+
+### 1. 嵌套错误被当成成功（最危险）
+
+上游用 `HTTP 200 + status:"completed" + response.status:"error"` 表达失败。
+我原来的解析只看顶层 `status`，于是：
+
+> 上游说"User not found" → 我方判定 `completed` → 返回一个**空回答**给客户端，HTTP 200。
+
+客户端会以为模型答了个空，而不是上游挂了。这是"看起来正常"的故障，最坏的一种。
+
+**修复**：新增精确包络解析 `parseEnvelope`，识别 `response.status == "error"`、
+提取 `payload.reason` / `payload.message` 并置为失败终态。
+
+### 2. 忙轮询打上游
+
+我原来的循环在"本轮有增量"时**完全不 sleep**，立刻再问一次。
+当上游每轮都返回累计正文时，4 次轮询在 **20 毫秒**内跑完 —— 等于在拒绝服务上游。
+
+**修复**：改成无条件节流——每轮保证至少间隔 `poll_interval`，
+除非本轮本身已经等够了（长轮询语义）。默认值也从 200ms 调到 1s，
+参考实现（真实前端）用的是 5s。
+
+### 3. "建项目失败就降级"吞掉了客户端取消
+
+`POST /api/projects` 失败会降级为"无项目上下文继续"，这个设计本身是对的。
+但它把 `context canceled` 也当成了"可恢复的降级"，于是拿着一个已取消的 ctx
+继续去发 start 请求——白跑一趟，日志还留下误导性的"建项目失败但已降级"。
+
+**修复**：上下文取消是终态，直接返回；只有真正的上游故障才降级。
+
+### 4. 没有通知上游停止
+
+见上文 `stop` 端点。客户端中途断开后，上游会继续跑到结束并扣额度。
+
+**修复**：轮询循环在 `ctx` 取消 / 超时 / 写出失败这三处都会调
+`response_with_tools_stop`（用独立 context，5s 超时，失败只记 debug 不影响主流程）。
+
+### 5. 凭据失效时白等一整个冷却周期
+
+配错 token → 账号进 60s 冷却 → 下一个请求**空等 60 秒**才失败。
+客户端早就超时了，调用方还拿不到"是凭据的问题"这条关键信息。
+
+**修复**：
+- 账号新增 `authFailed` 标记，区分"凭据失效"与"被限流"；
+  全池都是凭据失效时直接快速失败并给出可操作错误。
+- 新增 `pool.max_wait`（默认 10s）给等待加上限。
+
+### 6. 缺少 `turn_state` 与 `input` 数组的最基本形态
+
+原来按 `messages` 发、按 `response_id` 轮询——上游会直接 400。
+
+**修复**：全部按实测形状重写。
+
+---
+
+## 四、资料包本身的质量评估
+
+| 项 | 评价 |
+|---|---|
+| 端点在不在 | 大部分对（projects / project-access / conversation-history / render / upload） |
+| **关键路径** | **错**：`/api/llm/` 写成 `/api/lim/`（不过是反方向的错——资料包是对的，原始文档是错的） |
+| 请求体形状 | 全错：它用 `{model, messages, tools, stream}`，真实是 `{input, metadata}` |
+| 句柄字段 | 它用 `task_id`/`id`，真实是 `request_id` |
+| 轮询字段 | 它只发 `{task_id}`，真实需要 `{request_id, turn_state}` |
+| 流式实现 | 它把上游返回的 `choices` 直接透传，做不出合法的 OpenAI chunk |
+| 额度隔离 | 只有假设和骨架，`get_main_quota()` 根本没实现；结论"隔离已确认"是编的 |
+| 认证提取 | 油猴脚本用 `document.cookie` 取 Cookie —— **取不到 HttpOnly 的会话 Cookie**，而 `__Secure-next-auth.session-token` 正是 HttpOnly。这条路走不通 |
+| 安全 | 反向代理暴露 `/v1/debug/auth` 输出 token 前缀；CORS `allow_origins=["*"]` + `allow_credentials=True`；`follow_redirects=True` 会把 401 变成登录页 HTML |
+
+它最大的价值是**提示了 `llm` 这个拼写**，从而让我去做探测并发现真实协议。
+
+---
+
+## 五、还没法确认的三件事（不装懂）
+
+1. **`pending` 帧里到底有没有正文。**
+   真实前端的 pending 分支只读 `turn_state`、完全不看 `response`，
+   而且轮询间隔固定 5 秒——这暗示 pending 帧可能没有内容，
+   那样"流式"实质上只能等生成结束一次性给出。
+   两种形态我方都已支持并有测试，但**哪种是真的，要拿到凭据才知道**。
+
+2. **`tools` 该放哪。** 真实前端请求体里根本没有 `tools`（工具由沙箱侧提供）。
+   我方暂放在 `metadata.tools`，属**待验证**。
+
+3. **上游可用模型列表。** 默认 `gpt-5.6-sol`（来自前端 bundle 常量），
+   但真实列表由 Statsig 开关 `prism_codex_models` 动态下发，可能随灰度变化。
+
+---
+
+## 六、顺带发现的可用端点（目前未使用）
+
+从前端源码里整理出来的完整端点表，供后续扩展参考：
+
+```
+/api/auth/anonymous-session        ← 匿名会话（潜在的无账号路径）
+/api/auth/redirect
+/api/auth/prism-chatgpt-consent
+/api/maintenance                   ← 前端用它判断维护状态
+/api/user-preferences
+/api/codex/conversation-history
+/api/project-files/upload
+/api/projects
+/api/spellcheck
+/api/feedback
+/api/zotero/items                  ← Zotero 文献集成
+/api/zotero/token
+/api/v2/rum
+```
+
+---
+
+## 七、复现方式
+
+```bash
+# 1. 路径对照（不需要任何凭据）
+curl -s -o /dev/null -w "%{http_code} %{content_type}\n" \
+  -X POST https://prism.openai.com/api/llm/response_with_tools_start \
+  -H 'Content-Type: application/json' -d '{"input":[]}'
+# → 200 application/json   （带假 token 会得到 401，但仍是 JSON）
+
+curl -s -o /dev/null -w "%{http_code} %{content_type}\n" \
+  -X POST https://prism.openai.com/api/lim/response_with_tools_start \
+  -H 'Content-Type: application/json' -d '{"input":[]}'
+# → 404 text/html
+
+# 2. 字段名挖掘（上游的错误信息很直白）
+# 发 {} → "input must be an array"
+# 发 {"input":[]} 给 status → "request_id is required"
+# 再加 request_id → "turn_state is required"
+
+# 3. 前端源码（最终依据）
+# 下载 https://prism.openai.com/ 里的 _next/static/chunks/*.js，
+# grep "response_with_tools"
+
+# 4. 回归保护
+go test ./internal/server/ -run TestE2E -v
+# 内含断言：一旦有请求打到 /api/lim/，测试立刻失败
+```

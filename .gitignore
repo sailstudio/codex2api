@@ -60,3 +60,9 @@ diagrams/
 
 # local e2e test scaffolding (mock upstream + scripts, not for CI)
 /local-test/
+
+# Prism: sentinel SDK 为上游运行时资产（混淆 bundle），由 sidecar 下载，不入库
+proxy/prism/assets/
+
+# prism-gateway 构建产物（本地验证用，不入库）
+prism-gateway/dist/

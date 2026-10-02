@@ -4498,6 +4498,11 @@ func extractUsageFromResult(usage gjson.Result) *UsageInfo {
 	if !usage.Exists() {
 		return nil
 	}
+	// 上游（如 Prism 私协议）可能显式标注 reported=false 且把计数置 null：
+	// 此时必须返回 nil，让下游按「未知」处理，而不是把 null 读成 0 冒充真实用量。
+	if reported := usage.Get("reported"); reported.Exists() && !reported.Bool() {
+		return nil
+	}
 	inputTokens := int(usage.Get("input_tokens").Int())
 	outputTokens := int(usage.Get("output_tokens").Int())
 	reasoningTokens := int(usage.Get("output_tokens_details.reasoning_tokens").Int())

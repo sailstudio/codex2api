@@ -408,15 +408,38 @@ func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel stri
 		return combine(antigravityChannelAccountFilter(effectiveModel))
 	case database.UpstreamChannelClaude:
 		return combine(claudeChannelAccountFilter(effectiveModel))
+	case database.UpstreamChannelPrism:
+		return combine(prismChannelAccountFilter(effectiveModel))
 	case database.UpstreamChannelCodex:
 		return func(account *auth.Account) bool {
-			if account == nil || account.IsGrokAPI() || account.IsAntigravityAPI() || account.IsClaudeOAuth() {
+			if account == nil || account.IsGrokAPI() || account.IsAntigravityAPI() || account.IsClaudeOAuth() || account.IsPrismAPI() {
 				return false
 			}
 			return filter == nil || filter(account)
 		}
 	}
 	return filter
+}
+
+// prismChannelAccountFilter 是 prism 渠道 Key 的账号过滤器：仅 Prism 账号。
+//
+// Prism 是 relay-style 上游，**默认过滤（accountFilterForModel）会排除所有
+// relay-style 账号**，因此不配 upstream_channel=prism 的 Key 永远选不到 Prism
+// 账号。这与 Grok / Claude / Antigravity 的选用方式一致。
+//
+// 模型不做白名单准入：Prism 的模型由对话材料决定（见 proxy/prism/responses.go
+// 的 model 回退逻辑），账号侧的 models 只是可选的收窄项，空表示全部放行。
+func prismChannelAccountFilter(model string) auth.AccountFilter {
+	model = strings.TrimSpace(model)
+	return func(account *auth.Account) bool {
+		if account == nil || !account.IsPrismAPI() {
+			return false
+		}
+		if model != "" && account.IsModelRateLimited(model) {
+			return false
+		}
+		return true
+	}
 }
 
 func claudeChannelAccountFilter(model string) auth.AccountFilter {
@@ -569,6 +592,25 @@ func relayAccountSupportsModel(account *auth.Account, model string) bool {
 	}
 	if account.IsGrokAPI() {
 		return grokAccountSupportsVisibleModel(account, model)
+	}
+	// Prism 是 relay-style 上游。它的**模型由对话材料决定**：材料里的
+	// metadata.model 与沙箱/会话快照绑定，改写会被上游以 400 拒绝
+	// （见 proxy/prism/responses.go 的 model 回退逻辑）。因此这里不做目录准入，
+	// 账号侧的 models 白名单只作可选收窄，为空表示全部放行。
+	// 漏掉这个分支会让 Prism 账号落到下方 OpenAI Responses 判定而恒为 false，
+	// 表现为「账号在线但请求永远 503 无可用账号」。
+	if account.IsPrismAPI() {
+		models := account.Models
+		if len(models) == 0 {
+			return true
+		}
+		want := strings.TrimSpace(model)
+		for _, m := range models {
+			if strings.EqualFold(strings.TrimSpace(m), want) {
+				return true
+			}
+		}
+		return false
 	}
 	if account.SupportsOpenAIResponsesModel(model) {
 		return true
