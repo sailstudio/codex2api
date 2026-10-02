@@ -2041,12 +2041,20 @@ func ExecuteRelayStyleProtocolRequest(ctx context.Context, account *auth.Account
 	if len(responsesBody) == 0 {
 		responsesBody = inboundBody
 	}
+	// Prism 渠道：私协议（start/poll）适配成 Responses SSE。
+	// 放在 openai_responses 之前，因为它同样吃 Responses 体但上游完全不同。
+	if account != nil && account.IsPrismAPI() {
+		return ExecutePrismResponsesRequest(ctx, account, responsesBody)
+	}
 	return ExecuteOpenAIResponsesRequest(ctx, account, responsesBody, proxyOverride, headers)
 }
 
 func relayUpstreamEndpointForProtocol(account *auth.Account, inbound GrokProtocol, model string) string {
 	if account != nil && account.IsGrokAPI() {
 		return ResolveGrokUpstreamRoute(account, model, inbound, time.Now()).Endpoint
+	}
+	if account != nil && account.IsPrismAPI() {
+		return "https://prism.openai.com/api/llm/response_with_tools_start"
 	}
 	return relayUpstreamEndpointForAccount(account)
 }

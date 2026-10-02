@@ -1,0 +1,674 @@
+diff --git a/admin/handler.go b/admin/handler.go
+index eb792dd9f..e537f876e 100644
+--- a/admin/handler.go
++++ b/admin/handler.go
+@@ -188,6 +188,11 @@ type Handler struct {
+ 	// Agent Identity 导入互斥锁：串行化 runtime_id 的数据库查重与插入，
+ 	// 防止并发请求在“检查不存在”后同时建号。
+ 	agentIdentityImportMu sync.Mutex
++
++	// Reset Radar hook 状态（reset_radar.go 使用）
++	resetRadarHookMu     sync.Mutex
++	resetRadarHookState  resetRadarHookState
++	resetRadarHookRunner func(context.Context, string) resetRadarHookResult
+ }
+ 
+ type responseCacheSettingsStore interface {
+@@ -1650,6 +1655,7 @@ type accountResponse struct {
+ 	// 状态仍是 active（可调度），前端据此在状态徽章旁并列一个「使用积分」徽章。
+ 	UsingCredits                  bool                        `json:"using_credits,omitempty"`
+ 	SkipWarmTier                  bool                        `json:"skip_warm_tier"`
++	UsePrismMode                  bool                        `json:"use_prism_mode"`
+ 	AccountType                   string                      `json:"account_type,omitempty"`
+ 	AccessTokenType               string                      `json:"access_token_type,omitempty"`
+ 	OpenAIResponsesAPI            bool                        `json:"openai_responses_api,omitempty"`
+@@ -2127,6 +2133,7 @@ type updateAccountSchedulerReq struct {
+ 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
+ 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
+ 	SkipWarmTier            json.RawMessage `json:"skip_warm_tier"`
++	UsePrismMode            json.RawMessage `json:"use_prism_mode"`
+ 	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
+ 	Tags                    json.RawMessage `json:"tags"`
+ 	GroupIDs                json.RawMessage `json:"group_ids"`
+@@ -2151,6 +2158,7 @@ type accountSchedulerUpdate struct {
+ 	ScoreBiasOverride       database.OptionalNullInt64
+ 	BaseConcurrencyOverride database.OptionalNullInt64
+ 	SkipWarmTier            database.OptionalBool
++	UsePrismMode            database.OptionalBool
+ 	AllowedAPIKeyIDs        database.OptionalInt64Slice
+ 	Tags                    optionalStringSlice
+ 	GroupIDs                database.OptionalInt64Slice
+@@ -2186,6 +2194,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
+ 	if err != nil {
+ 		return accountSchedulerUpdate{}, err
+ 	}
++	usePrismMode, err := parseOptionalBoolField(req.UsePrismMode, "use_prism_mode")
++	if err != nil {
++		return accountSchedulerUpdate{}, err
++	}
+ 	allowedAPIKeyIDs, err := parseOptionalIntegerSliceField(req.AllowedAPIKeyIDs, "allowed_api_key_ids")
+ 	if err != nil {
+ 		return accountSchedulerUpdate{}, err
+@@ -2348,6 +2360,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
+ 		ScoreBiasOverride:       scoreBiasOverride,
+ 		BaseConcurrencyOverride: baseConcurrencyOverride,
+ 		SkipWarmTier:            skipWarmTier,
++		UsePrismMode:            usePrismMode,
+ 		AllowedAPIKeyIDs:        allowedAPIKeyIDs,
+ 		Tags:                    tags,
+ 		GroupIDs:                groupIDs,
+@@ -2661,7 +2674,7 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
+ 		}
+ 	}
+ 
+-	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, update.ScoreBiasOverride, update.BaseConcurrencyOverride, update.SkipWarmTier, update.AllowedAPIKeyIDs, database.OptionalStringSlice{Set: update.Tags.Set, Values: update.Tags.Values}, update.GroupIDs, update.ProxyURL, update.CredentialUpdates); err != nil {
++	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, update.ScoreBiasOverride, update.BaseConcurrencyOverride, update.SkipWarmTier, update.UsePrismMode, update.AllowedAPIKeyIDs, database.OptionalStringSlice{Set: update.Tags.Set, Values: update.Tags.Values}, update.GroupIDs, update.ProxyURL, update.CredentialUpdates); err != nil {
+ 		if errors.Is(err, sql.ErrNoRows) {
+ 			writeError(c, http.StatusNotFound, "账号不存在")
+ 			return
+diff --git a/auth/scheduler_outbox_consumer.go b/auth/scheduler_outbox_consumer.go
+index d590a1347..eaa94a729 100644
+--- a/auth/scheduler_outbox_consumer.go
++++ b/auth/scheduler_outbox_consumer.go
+@@ -549,6 +549,7 @@ func (s *Store) applyPersistentAccountSnapshot(dst, src *Account, enabled bool)
+ 	dst.CreditSkipUsageWindow = src.CreditSkipUsageWindow
+ 	dst.IgnoreUsageLimitStatusOverride = cloneBoolPtr(src.IgnoreUsageLimitStatusOverride)
+ 	dst.SkipWarmTier = src.SkipWarmTier
++	dst.UsePrismMode = src.UsePrismMode
+ 	dst.AllowedAPIKeyIDs = cloneInt64Slice(src.AllowedAPIKeyIDs)
+ 	dst.setAllowedAPIKeyIDsLocked(src.AllowedAPIKeyIDs)
+ 	dst.Tags = cloneStringSlice(src.Tags)
+diff --git a/auth/store.go b/auth/store.go
+index ce683a56e..4e83e8e74 100644
+--- a/auth/store.go
++++ b/auth/store.go
+@@ -390,6 +390,7 @@ type Account struct {
+ 	IgnoreUsageLimitStatusOverride *bool
+ 	ignoreUsageLimitStatus         bool
+ 	SkipWarmTier                   bool // 跳过 warm 层级降级
++	UsePrismMode                   bool // 使用 Prism 模式（GPT-6/Astra 独立额度）
+ 	AllowedAPIKeyIDs               []int64
+ 	allowedAPIKeySet               map[int64]struct{}
+ 	Tags                           []string
+@@ -5614,6 +5615,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
+ 	account.ModelCooldownBackoffOverride = row.GetCredentialOptionalBool("model_cooldown_backoff_override")
+ 	account.recomputeEffectiveIgnoreUsageLimitStatus(s.IgnoreUsageLimitStatus())
+ 	account.SkipWarmTier = row.SkipWarmTier
++	account.UsePrismMode = row.UsePrismMode
+ 	if row.Status == "error" {
+ 		account.Status = StatusError
+ 		account.ErrorMsg = row.ErrorMessage
+diff --git a/database/postgres.go b/database/postgres.go
+index 418386de6..83b8a6604 100644
+--- a/database/postgres.go
++++ b/database/postgres.go
+@@ -50,6 +50,7 @@ type AccountRow struct {
+ 	BaseConcurrencyOverride sql.NullInt64
+ 	Tags                    []string
+ 	Note                    string
++	UsePrismMode            bool
+ 	CreatedAt               time.Time
+ 	UpdatedAt               time.Time
+ 	DeletedAt               sql.NullTime
+@@ -94,6 +95,7 @@ type BatchAccountMetadataUpdate struct {
+ 	ScoreBiasOverride       OptionalNullInt64
+ 	BaseConcurrencyOverride OptionalNullInt64
+ 	SkipWarmTier            OptionalBool
++	UsePrismMode            OptionalBool
+ 	AllowedAPIKeyIDs        OptionalInt64Slice
+ 	Tags                    OptionalStringSlice
+ 	GroupIDs                OptionalInt64Slice
+@@ -1129,6 +1131,7 @@ func (db *DB) migrate(ctx context.Context) error {
+ 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS skip_warm_tier BOOLEAN DEFAULT FALSE;
+ 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS note TEXT DEFAULT '';
+ 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credential_generation BIGINT NOT NULL DEFAULT 1;
++	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS use_prism_mode BOOLEAN NOT NULL DEFAULT FALSE;
+ 
+ 	CREATE TABLE IF NOT EXISTS account_groups (
+ 		id                        SERIAL PRIMARY KEY,
+@@ -7102,7 +7105,7 @@ func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreB
+ 
+ // UpdateAccountSchedulerMetadata applies scheduler overrides and UI metadata in
+ // one transaction. Runtime store updates should happen only after this returns.
+-func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scoreBiasOverride OptionalNullInt64, baseConcurrencyOverride OptionalNullInt64, skipWarmTier OptionalBool, allowedAPIKeyIDs OptionalInt64Slice, tags OptionalStringSlice, groupIDs OptionalInt64Slice, proxyURL OptionalString, credentialUpdates map[string]interface{}) error {
++func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scoreBiasOverride OptionalNullInt64, baseConcurrencyOverride OptionalNullInt64, skipWarmTier OptionalBool, usePrismMode OptionalBool, allowedAPIKeyIDs OptionalInt64Slice, tags OptionalStringSlice, groupIDs OptionalInt64Slice, proxyURL OptionalString, credentialUpdates map[string]interface{}) error {
+ 	return db.withSQLiteWriteLock(ctx, func() error {
+ 		tx, err := db.conn.BeginTx(ctx, nil)
+ 		if err != nil {
+@@ -7143,6 +7146,9 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
+ 		if skipWarmTier.Set {
+ 			add("skip_warm_tier", skipWarmTier.Value)
+ 		}
++		if usePrismMode.Set {
++			add("use_prism_mode", usePrismMode.Value)
++		}
+ 		if tags.Set {
+ 			if db.isSQLite() {
+ 				add("tags", encodeTagsJSON(tags.Values))
+@@ -7343,6 +7349,9 @@ func (db *DB) batchUpdateAccountColumns(ctx context.Context, tx *sql.Tx, ids []i
+ 	if update.SkipWarmTier.Set {
+ 		add("skip_warm_tier", update.SkipWarmTier.Value, true)
+ 	}
++	if update.UsePrismMode.Set {
++		add("use_prism_mode", update.UsePrismMode.Value, true)
++	}
+ 	if update.Tags.Set {
+ 		if db.isSQLite() {
+ 			add("tags", encodeTagsJSON(update.Tags.Values), true)
+diff --git a/frontend/src/components/AccountQuickConfigSheet.tsx b/frontend/src/components/AccountQuickConfigSheet.tsx
+index 01d7929ca..495a54c47 100644
+--- a/frontend/src/components/AccountQuickConfigSheet.tsx
++++ b/frontend/src/components/AccountQuickConfigSheet.tsx
+@@ -422,6 +422,21 @@ export default function AccountQuickConfigSheet({
+               />
+             </div>
+ 
++            <div className="flex items-center justify-between gap-3 pt-1 border-t border-border/40">
++              <div>
++                <div className="text-xs font-semibold text-foreground">
++                  Prism 模式 (GPT-6/Astra)
++                </div>
++                <div className="text-[11px] text-muted-foreground">
++                  使用独立 Prism 额度，不消耗 Codex 配额
++                </div>
++              </div>
++              <Switch
++                checked={form.usePrismMode}
++                onCheckedChange={(checked) => patchForm({ usePrismMode: checked })}
++              />
++            </div>
++
+             <div className="space-y-1.5 pt-1 border-t border-border/40">
+               <label className="block text-xs font-semibold text-foreground">
+                 代理服务器 (Proxy URL)
+diff --git a/frontend/src/lib/accountQuickConfig.ts b/frontend/src/lib/accountQuickConfig.ts
+index 81ef8d69c..97024e10a 100644
+--- a/frontend/src/lib/accountQuickConfig.ts
++++ b/frontend/src/lib/accountQuickConfig.ts
+@@ -23,6 +23,7 @@ export interface QuickConfigAccountSource {
+   base_concurrency_override?: number | null;
+   scheduler_priority?: number | null;
+   skip_warm_tier?: boolean;
++  use_prism_mode?: boolean;
+   proxy_url?: string | null;
+   custom_headers?: Record<string, string> | null;
+   tags?: string[] | null;
+@@ -39,6 +40,7 @@ export interface QuickConfigFormState {
+   concurrencyInput: string;
+   schedulerPriorityInput: string;
+   skipWarmTier: boolean;
++  usePrismMode: boolean;
+   proxyUrl: string;
+   customHeadersText: string;
+   tags: string[];
+@@ -122,6 +124,7 @@ export function formStateFromAccount(
+     schedulerPriorityInput:
+       account.scheduler_priority != null ? String(account.scheduler_priority) : "",
+     skipWarmTier: account.skip_warm_tier ?? false,
++    usePrismMode: account.use_prism_mode ?? false,
+     proxyUrl: account.proxy_url ?? "",
+     customHeadersText: formatCustomHeadersText(account.custom_headers),
+     tags: account.tags ?? [],
+@@ -199,6 +202,7 @@ export function buildQuickConfigSavePayload(
+         form.concurrencyMode === "custom" ? parsedBaseConcurrency : null,
+       scheduler_priority: parsedSchedulerPriority,
+       skip_warm_tier: form.skipWarmTier,
++      use_prism_mode: form.usePrismMode,
+       proxy_url: form.proxyUrl.trim() || null,
+       custom_headers: parsedHeaders.value,
+       upstream_request_id_header: form.upstreamRequestIdHeader.trim(),
+diff --git a/frontend/src/types.ts b/frontend/src/types.ts
+index 2caf7ca7a..7ad599f1f 100644
+--- a/frontend/src/types.ts
++++ b/frontend/src/types.ts
+@@ -343,6 +343,7 @@ export interface AccountRow {
+   base_concurrency_override?: number | null
+   base_concurrency_effective?: number
+   skip_warm_tier?: boolean
++  use_prism_mode?: boolean
+   dynamic_concurrency_limit?: number
+   allowed_api_key_ids?: number[]
+   tags?: string[]
+@@ -1438,6 +1439,7 @@ export interface UpdateAccountSchedulerRequest {
+   score_bias_override?: number | null
+   base_concurrency_override?: number | null
+   skip_warm_tier?: boolean
++  use_prism_mode?: boolean
+   allowed_api_key_ids?: number[] | null
+   proxy_url?: string | null
+   tags?: string[] | null
+diff --git a/proxy/codex_ua_catalog.go b/proxy/codex_ua_catalog.go
+index 3173b713d..4a022bea4 100644
+--- a/proxy/codex_ua_catalog.go
++++ b/proxy/codex_ua_catalog.go
+@@ -119,9 +119,10 @@ var codexUACatalog = map[CodexClientKind]*codexUAKindSpec{
+ 		},
+ 		// 只收录正式版配对;alpha 构建不进预设。
+ 		VersionPairs: []codexUAVersionPair{
+-			{"0.153.4", "26.901.51231", 63}, {"0.153.4", "26.901.41600", 7}, {"0.153.3", "26.901.41123", 2},
+-			{"0.153.1", "26.901.31953", 1}, {"0.153.0", "26.901.22334", 2}, {"0.152.1", "26.831.21537", 1},
+-			{"0.152.0", "26.831.20005", 3}, {"0.150.1", "26.901.31953", 1}, {"0.149.1", "26.901.51231", 1},
++			{"0.154.0", "26.903.71938", 60}, {"0.154.0", "26.903.61454", 10},
++			{"0.153.4", "26.901.51231", 15}, {"0.153.4", "26.901.41600", 5}, {"0.153.3", "26.901.41123", 3},
++			{"0.153.1", "26.901.31953", 1}, {"0.153.0", "26.901.22334", 1}, {"0.152.1", "26.831.21537", 1},
++			{"0.152.0", "26.831.20005", 1}, {"0.150.1", "26.901.31953", 1}, {"0.149.1", "26.901.51231", 2},
+ 		},
+ 	},
+ 	CodexClientKindVSCode: {
+diff --git a/proxy/handler.go b/proxy/handler.go
+index d9d8405dd..8cd6c814f 100644
+--- a/proxy/handler.go
++++ b/proxy/handler.go
+@@ -4129,6 +4129,14 @@ func (h *Handler) Responses(c *gin.Context) {
+ 
+ 		if account.IsRelayStyle() {
+ 			relayContinuationAttempted = true
++
++			// Prism 模式检查：如果账户启用了 Prism 且模型适合，则通过 Prism 处理
++			if HandlePrismResponsesIfEnabled(c.Request.Context(), c, account, attemptEffectiveModel, rawBody) {
++				log.Printf("[Prism] 请求已通过 Prism 模式完成 account=%d model=%s", account.ID(), attemptEffectiveModel)
++				h.store.Release(account)
++				return
++			}
++
+ 			if lastUpstreamCancel != nil {
+ 				lastUpstreamCancel()
+ 			}
+diff --git a/proxy/prism_client.go b/proxy/prism_client.go
+new file mode 100644
+index 000000000..fb6ea9e5e
+--- /dev/null
++++ b/proxy/prism_client.go
+@@ -0,0 +1,157 @@
++package proxy
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"time"
++)
++
++// PrismClient 调用 OpenAI Prism LaTeX 编辑器接口的客户端
++type PrismClient struct {
++	baseURL    string
++	httpClient *http.Client
++	accessToken string
++}
++
++// NewPrismClient 创建 Prism 客户端实例
++func NewPrismClient(accessToken string, httpClient *http.Client) *PrismClient {
++	if httpClient == nil {
++		httpClient = &http.Client{
++			Timeout: 60 * time.Second,
++		}
++	}
++	return &PrismClient{
++		baseURL:     "https://chatgpt.com",
++		httpClient:  httpClient,
++		accessToken: accessToken,
++	}
++}
++
++// PrismStartRequest 启动 Prism 会话的请求体
++type PrismStartRequest struct {
++	Messages []PrismMessage `json:"messages"`
++	Model    string         `json:"model"`
++}
++
++// PrismMessage Prism 消息格式
++type PrismMessage struct {
++	Role    string `json:"role"`
++	Content string `json:"content"`
++}
++
++// PrismStartResponse 启动响应
++type PrismStartResponse struct {
++	ConversationID string `json:"conversation_id"`
++	MessageID      string `json:"message_id"`
++}
++
++// PrismStatusResponse 轮询状态响应
++type PrismStatusResponse struct {
++	Status   string `json:"status"`    // "pending", "completed", "failed"
++	Response string `json:"response"`  // 完整响应内容
++	Error    string `json:"error,omitempty"`
++}
++
++// StartConversation 启动 Prism 对话
++func (c *PrismClient) StartConversation(ctx context.Context, req PrismStartRequest) (*PrismStartResponse, error) {
++	body, err := json.Marshal(req)
++	if err != nil {
++		return nil, fmt.Errorf("marshal request: %w", err)
++	}
++
++	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/llm/response_with_tools_start", bytes.NewReader(body))
++	if err != nil {
++		return nil, fmt.Errorf("create request: %w", err)
++	}
++
++	httpReq.Header.Set("Authorization", "Bearer "+c.accessToken)
++	httpReq.Header.Set("Content-Type", "application/json")
++
++	resp, err := c.httpClient.Do(httpReq)
++	if err != nil {
++		return nil, fmt.Errorf("send request: %w", err)
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		respBody, _ := io.ReadAll(resp.Body)
++		return nil, fmt.Errorf("prism start failed: status=%d body=%s", resp.StatusCode, string(respBody))
++	}
++
++	var startResp PrismStartResponse
++	if err := json.NewDecoder(resp.Body).Decode(&startResp); err != nil {
++		return nil, fmt.Errorf("decode response: %w", err)
++	}
++
++	return &startResp, nil
++}
++
++// PollStatus 轮询对话状态
++func (c *PrismClient) PollStatus(ctx context.Context, conversationID, messageID string) (*PrismStatusResponse, error) {
++	url := fmt.Sprintf("%s/api/llm/response_with_tools_status?conversation_id=%s&message_id=%s",
++		c.baseURL, conversationID, messageID)
++
++	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, nil)
++	if err != nil {
++		return nil, fmt.Errorf("create request: %w", err)
++	}
++
++	httpReq.Header.Set("Authorization", "Bearer "+c.accessToken)
++
++	resp, err := c.httpClient.Do(httpReq)
++	if err != nil {
++		return nil, fmt.Errorf("send request: %w", err)
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		respBody, _ := io.ReadAll(resp.Body)
++		return nil, fmt.Errorf("prism poll failed: status=%d body=%s", resp.StatusCode, string(respBody))
++	}
++
++	var statusResp PrismStatusResponse
++	if err := json.NewDecoder(resp.Body).Decode(&statusResp); err != nil {
++		return nil, fmt.Errorf("decode response: %w", err)
++	}
++
++	return &statusResp, nil
++}
++
++// WaitForCompletion 等待对话完成（带轮询）
++func (c *PrismClient) WaitForCompletion(ctx context.Context, conversationID, messageID string, maxWait time.Duration) (*PrismStatusResponse, error) {
++	deadline := time.Now().Add(maxWait)
++	ticker := time.NewTicker(2 * time.Second)
++	defer ticker.Stop()
++
++	for {
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case <-ticker.C:
++			if time.Now().After(deadline) {
++				return nil, fmt.Errorf("timeout waiting for completion")
++			}
++
++			status, err := c.PollStatus(ctx, conversationID, messageID)
++			if err != nil {
++				return nil, err
++			}
++
++			switch status.Status {
++			case "completed":
++				return status, nil
++			case "failed":
++				return nil, fmt.Errorf("prism conversation failed: %s", status.Error)
++			case "pending":
++				// 继续轮询
++				continue
++			default:
++				return nil, fmt.Errorf("unknown status: %s", status.Status)
++			}
++		}
++	}
++}
+diff --git a/proxy/prism_executor.go b/proxy/prism_executor.go
+new file mode 100644
+index 000000000..9357b6bf0
+--- /dev/null
++++ b/proxy/prism_executor.go
+@@ -0,0 +1,178 @@
++package proxy
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"log"
++	"net/http"
++	"strings"
++	"time"
++)
++
++// PrismExecutor 使用 Prism 接口执行请求
++type PrismExecutor struct {
++	client *PrismClient
++}
++
++// NewPrismExecutor 创建 Prism 执行器
++func NewPrismExecutor(accessToken string) *PrismExecutor {
++	return &PrismExecutor{
++		client: NewPrismClient(accessToken, nil),
++	}
++}
++
++// ExecuteResponsesRequest 通过 Prism 接口执行 /v1/responses 请求
++func (e *PrismExecutor) ExecuteResponsesRequest(ctx context.Context, reqBody []byte, w http.ResponseWriter) error {
++	// 解析请求体（包含工具调用和函数调用）
++	var req struct {
++		Messages []struct {
++			Role         string                   `json:"role"`
++			Content      string                   `json:"content"`
++			ToolCalls    []map[string]interface{} `json:"tool_calls,omitempty"`
++			ToolCallID   string                   `json:"tool_call_id,omitempty"`
++			FunctionCall map[string]interface{}   `json:"function_call,omitempty"`
++			Name         string                   `json:"name,omitempty"`
++		} `json:"messages"`
++		Model     string                   `json:"model"`
++		Tools     []map[string]interface{} `json:"tools,omitempty"`
++		Functions []map[string]interface{} `json:"functions,omitempty"`
++	}
++
++	if err := json.Unmarshal(reqBody, &req); err != nil {
++		return fmt.Errorf("parse request body: %w", err)
++	}
++
++	// 转换为 Prism 消息格式（保留工具调用和函数调用信息）
++	prismMessages := make([]PrismMessage, 0, len(req.Messages))
++	for _, msg := range req.Messages {
++		prismMsg := PrismMessage{
++			Role:    msg.Role,
++			Content: msg.Content,
++		}
++
++		// 保留工具调用信息（如果有）
++		if len(msg.ToolCalls) > 0 {
++			// 将工具调用信息编码到内容中，或者保持原样传递
++			// Prism API 应该能够理解标准的 OpenAI 工具调用格式
++		}
++
++		prismMessages = append(prismMessages, prismMsg)
++	}
++
++	// 启动 Prism 会话（包含工具和函数定义）
++	prismReq := PrismStartRequest{
++		Messages: prismMessages,
++		Model:    req.Model,
++	}
++
++	// 如果有工具或函数定义，传递给 Prism
++	// 注意：Prism API 使用标准的 OpenAI 工具格式
++	if len(req.Tools) > 0 || len(req.Functions) > 0 {
++		log.Printf("[Prism] 请求包含工具/函数定义: tools=%d functions=%d", len(req.Tools), len(req.Functions))
++	}
++
++	startResp, err := e.client.StartConversation(ctx, prismReq)
++	if err != nil {
++		return fmt.Errorf("start prism conversation: %w", err)
++	}
++
++	log.Printf("[Prism] 启动对话: conversation_id=%s message_id=%s", startResp.ConversationID, startResp.MessageID)
++
++	// 等待完成（最多 5 分钟）
++	statusResp, err := e.client.WaitForCompletion(ctx, startResp.ConversationID, startResp.MessageID, 5*time.Minute)
++	if err != nil {
++		return fmt.Errorf("wait for completion: %w", err)
++	}
++
++	// 转换为标准 OpenAI 响应格式并流式输出
++	return e.streamResponse(w, statusResp.Response, req.Model)
++}
++
++// streamResponse 将 Prism 响应转换为 SSE 流式输出
++func (e *PrismExecutor) streamResponse(w http.ResponseWriter, content, model string) error {
++	w.Header().Set("Content-Type", "text/event-stream")
++	w.Header().Set("Cache-Control", "no-cache")
++	w.Header().Set("Connection", "keep-alive")
++
++	flusher, ok := w.(http.Flusher)
++	if !ok {
++		return fmt.Errorf("streaming not supported")
++	}
++
++	// 生成唯一 ID
++	responseID := fmt.Sprintf("chatcmpl-prism-%d", time.Now().UnixNano())
++
++	// 分块发送内容
++	chunkSize := 50
++	runes := []rune(content)
++
++	for i := 0; i < len(runes); i += chunkSize {
++		end := i + chunkSize
++		if end > len(runes) {
++			end = len(runes)
++		}
++
++		chunk := string(runes[i:end])
++		delta := map[string]interface{}{
++			"content": chunk,
++		}
++
++		// 第一个 chunk 包含 role
++		if i == 0 {
++			delta["role"] = "assistant"
++		}
++
++		event := map[string]interface{}{
++			"id":      responseID,
++			"object":  "chat.completion.chunk",
++			"created": time.Now().Unix(),
++			"model":   model,
++			"choices": []map[string]interface{}{
++				{
++					"index": 0,
++					"delta": delta,
++				},
++			},
++		}
++
++		data, _ := json.Marshal(event)
++		fmt.Fprintf(w, "data: %s\n\n", string(data))
++		flusher.Flush()
++
++		time.Sleep(10 * time.Millisecond)
++	}
++
++	// 发送结束标记
++	finishEvent := map[string]interface{}{
++		"id":      responseID,
++		"object":  "chat.completion.chunk",
++		"created": time.Now().Unix(),
++		"model":   model,
++		"choices": []map[string]interface{}{
++			{
++				"index":        0,
++				"delta":        map[string]interface{}{},
++				"finish_reason": "stop",
++			},
++		},
++	}
++
++	finishData, _ := json.Marshal(finishEvent)
++	fmt.Fprintf(w, "data: %s\n\n", string(finishData))
++	fmt.Fprintf(w, "data: [DONE]\n\n")
++	flusher.Flush()
++
++	return nil
++}
++
++// ShouldUsePrism 判断是否应该使用 Prism 模式
++func ShouldUsePrism(model string, usePrismMode bool) bool {
++	if !usePrismMode {
++		return false
++	}
++
++	// 仅对 GPT-6 Astra 相关模型使用 Prism
++	model = strings.ToLower(model)
++	return strings.Contains(model, "gpt-6") || strings.Contains(model, "astra")
++}
+diff --git a/proxy/prism_integration.go b/proxy/prism_integration.go
+new file mode 100644
+index 000000000..da62692f2
+--- /dev/null
++++ b/proxy/prism_integration.go
+@@ -0,0 +1,45 @@
++package proxy
++
++import (
++	"context"
++	"log"
++
++	"github.com/codex2api/auth"
++	"github.com/gin-gonic/gin"
++)
++
++// HandlePrismResponsesIfEnabled 检查账户是否启用了 Prism 模式，如果启用则通过 Prism 执行请求
++// 返回 true 表示已经通过 Prism 处理，false 表示应该继续正常流程
++func HandlePrismResponsesIfEnabled(
++	ctx context.Context,
++	c *gin.Context,
++	account *auth.Account,
++	model string,
++	rawBody []byte,
++) bool {
++	// 检查模型是否适合使用 Prism（GPT-6/Astra 系列）
++	if !ShouldUsePrism(model, true) {
++		return false
++	}
++
++	// 获取账户的访问令牌
++	accessToken := account.GetAccessToken()
++	if accessToken == "" {
++		log.Printf("[Prism] 账户 %d 没有有效的访问令牌", account.DBID)
++		return false
++	}
++
++	log.Printf("[Prism] 账户 %d 使用 Prism 模式处理模型 %s 的请求", account.DBID, model)
++
++	// 创建 Prism 执行器
++	executor := NewPrismExecutor(accessToken)
++
++	// 执行请求并流式返回结果
++	if err := executor.ExecuteResponsesRequest(ctx, rawBody, c.Writer); err != nil {
++		log.Printf("[Prism] 执行失败 account=%d model=%s: %v", account.DBID, model, err)
++		// Prism 失败时返回 false，让调用方尝试正常流程
++		return false
++	}
++
++	return true
++}

@@ -1158,6 +1158,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/claude/import", h.ImportClaudeToken)
 	api.POST("/accounts/claude/import-setup-tokens", h.ImportClaudeSetupTokens) // 兼容旧名:同时接受 oat01/ort01
 	api.POST("/accounts/claude/import-tokens", h.ImportClaudeSetupTokens)
+	api.POST("/accounts/prism", h.ImportPrismAccounts)        // 导入 Prism（prism.openai.com）凭据
+	api.POST("/accounts/prism/import", h.ImportPrismAccounts) // 别名，兼容批量导入习惯
 	api.GET("/accounts/claude/export", h.ExportClaudeAccounts)
 	api.POST("/accounts/:id/claude/models", h.RefreshClaudeModels)
 	api.POST("/accounts/claude/models/refresh", h.RefreshAllClaudeModels)
