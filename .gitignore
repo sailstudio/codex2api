@@ -60,3 +60,22 @@ diagrams/
 
 # local e2e test scaffolding (mock upstream + scripts, not for CI)
 /local-test/
+
+# Runtime secrets / local process artifacts (never commit)
+.admin_secret
+.api_key
+.api_key_create.json
+.account_import.json
+codex2api-bin
+codex2api.pid
+*.pid
+secrets/
+.prism_accounts.json
+.prism_material.json
+*.prism-material.json
+*.prism-headers.json
+codex2api-prism-bin
+
+# Local CPA / Prism secrets directory (never commit)
+.secrets/
+DEPLOY_STATUS.txt

@@ -27,6 +27,7 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/config"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/prismchannel"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -55,6 +56,7 @@ func upstreamErrorConsoleBody(body []byte) string {
 
 // Handler API 路由处理器
 type Handler struct {
+	prismClient     *prismchannel.Client
 	store           *auth.Store
 	configKeys      map[string]bool // 配置文件中的静态 key
 	db              *database.DB
@@ -1282,6 +1284,13 @@ func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCf
 		apiKeyGate: newAPIKeyConcurrencyLimiter(),
 	}
 	handler.liveStore = newLiveCallStore(handler)
+	if cfg != nil && cfg.Prism.Enabled {
+		var err error
+		handler.prismClient, err = prismchannel.New(cfg.Prism)
+		if err != nil {
+			log.Printf("Prism channel initialization failed: %v", err)
+		}
+	}
 	return handler
 }
 
@@ -3083,6 +3092,8 @@ func appendMissingResponseImageOutputs(responseJSON []byte, imageOutputs []json.
 // RegisterRoutes 注册路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	auth := h.authMiddleware()
+	r.GET("/health/prism", h.prismHealth)
+	r.GET("/metrics/prism", auth, h.prismMetrics)
 
 	// /v1 前缀路由（标准路径）
 	v1 := r.Group("/v1")
@@ -3813,6 +3824,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	h.capturePromptRequestIngress(c, rawBody)
+	if h.handlePrism(c, rawBody, true) {
+		return
+	}
 	bodyReadDone := time.Now()
 	compactionMeta := requestCompactionMetaForHTTP(c, rawBody)
 	cacheRequestCompactionMeta(c, compactionMeta)
@@ -6733,6 +6747,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 	h.capturePromptRequestIngress(c, rawBody)
+	if h.handlePrism(c, rawBody, false) {
+		return
+	}
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rememberDaybreakRequest(c, rawBody)

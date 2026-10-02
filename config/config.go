@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codex2api/internal/prismchannel"
 	"github.com/joho/godotenv"
 )
 
@@ -90,6 +91,7 @@ func (c *CacheConfig) Label() string {
 // Config 全局核心环境配置（物理隔离的服务器参数）
 // 业务逻辑参数（如 ProxyURL，APIKeys，MaxConcurrency）已全部移至数据库 SystemSettings 进行化
 type Config struct {
+	Prism                     prismchannel.Config
 	Port                      int
 	BindAddress               string // 监听地址，默认 0.0.0.0（兼容 Docker / 反代 / 公网）；如需仅本机访问可设为 127.0.0.1
 	AdminSecret               string
@@ -136,6 +138,11 @@ func Load(envPath string) (*Config, error) {
 		Port:               8080,
 		MaxRequestBodySize: 48 * 1024 * 1024,
 	}
+	prismCfg, prismErr := prismchannel.LoadEnv()
+	if prismErr != nil {
+		return nil, prismErr
+	}
+	cfg.Prism = prismCfg
 
 	// Web服务端口
 	if port := os.Getenv("CODEX_PORT"); port != "" {
